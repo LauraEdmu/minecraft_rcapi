@@ -3,6 +3,8 @@ import os
 import re
 import secrets
 from typing import Annotated, Literal
+import json
+import math
 
 import uvicorn
 from dotenv import load_dotenv
@@ -34,6 +36,35 @@ app = FastAPI(title="Minecraft HTTP API")
 
 # Validate identifiers before inserting them into server commands.
 RESOURCE_RE = re.compile(r"[a-z0-9_.-]+:[a-z0-9_./-]+")
+
+
+def to_snbt(value) -> str:
+    """Convert JSON-compatible Python values to Minecraft SNBT."""
+
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            f"{json.dumps(k, ensure_ascii=False)}:{to_snbt(v)}"
+            for k, v in value.items()
+        ) + "}"
+
+    if isinstance(value, list):
+        return "[" + ",".join(to_snbt(v) for v in value) + "]"
+
+    if isinstance(value, bool):
+        return "1b" if value else "0b"
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Non-finite NBT number")
+        return f"{value}d"
+
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+
+    raise ValueError(f"Unsupported NBT value: {type(value).__name__}")
 
 
 def normalise_resource(value: str) -> str:
@@ -82,13 +113,17 @@ class GiveRequest(BaseModel):
     item: ResourceID = "minecraft:diamond"
     count: int = Field(default=1, ge=1, le=2304)
     player: PlayerName | None = None
-
+    custom_name: str | None = Field(default=None, max_length=256)
+    nbt_data: dict | None = None
 
 class SummonRequest(BaseModel):
     entity: ResourceID = "minecraft:zombie"
     count: int = Field(default=1, ge=1, le=10)
     player: PlayerName | None = None
     at_player: bool = False
+    nbt_data: dict | None = None
+    custom_name: str | None = Field(default=None, max_length=256)
+    name_visible: bool = True
 
 
 class EffectRequest(BaseModel):
@@ -155,32 +190,105 @@ def drop_item(data: DropRequest):
     }
 
 
+
+
 @app.post("/give", dependencies=[Depends(authenticate)])
 def give_item(data: GiveRequest):
     target = data.player or "@a"
-    command = f"give {target} {data.item} {data.count}"
-    logger.info("Giving %d %s to %s", data.count, data.item, target)
+    item = data.item
+    components = []
+
+    # Minecraft display name
+    if data.custom_name is not None:
+        text_component = json.dumps({
+            "text": data.custom_name,
+            "italic": False,
+        }, ensure_ascii=False)
+
+        components.append(
+            f"minecraft:custom_name={to_snbt(text_component)}"
+        )
+
+    # Arbitrary custom NBT data
+    if data.nbt_data is not None:
+        try:
+            nbt = to_snbt(data.nbt_data)
+            components.append(f"minecraft:custom_data={nbt}")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if components:
+        item += f"[{','.join(components)}]"
+
+    command = f"give {target} {item} {data.count}"
+
+    logger.info(
+        "Giving %d %s to %s (Name: %s, NBT: %s)",
+        data.count,
+        data.item,
+        target,
+        data.custom_name,
+        data.nbt_data,
+    )
+
     return {
         "item": data.item,
         "count": data.count,
         "target": target,
+        "custom_name": data.custom_name,
+        "nbt_data": data.nbt_data,
         **send_commands([command]),
     }
+
+
+
 
 
 @app.post("/summon", dependencies=[Depends(authenticate)])
 def summon_entity(data: SummonRequest):
     target = data.player or "@a"
-    # Summon beside each target player, not inside them.
-    if data.at_player:
-        command = f"execute at {target} run summon {data.entity} ~ ~ ~"
-    else:
-        command = f"execute at {target} run summon {data.entity} ~2 ~ ~"
-    logger.info("Summoning %d %s near %s", data.count, data.entity, target)
+    position = "~ ~ ~" if data.at_player else "~2 ~ ~"
+
+    # Copy NBT to avoid modifying the original request data.
+    nbt_data = dict(data.nbt_data or {})
+
+    # Apply custom name if provided.
+    if data.custom_name is not None:
+        nbt_data["CustomName"] = json.dumps({
+            "text": data.custom_name,
+            "italic": False,
+        }, ensure_ascii=False)
+
+        nbt_data["CustomNameVisible"] = data.name_visible
+
+    # Convert NBT to SNBT.
+    try:
+        nbt = f" {to_snbt(nbt_data)}" if nbt_data else ""
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    command = (
+        f"execute at {target} run summon "
+        f"{data.entity} {position}{nbt}"
+    )
+
+    logger.info(
+        "Summoning %d %s near %s (Name: %s, NBT: %s)",
+        data.count,
+        data.entity,
+        target,
+        data.custom_name,
+        nbt_data,
+    )
+
     return {
         "entity": data.entity,
         "count": data.count,
         "target": target,
+        "at_player": data.at_player,
+        "custom_name": data.custom_name,
+        "name_visible": data.name_visible,
+        "nbt_data": nbt_data,
         **send_commands([command] * data.count),
     }
 
