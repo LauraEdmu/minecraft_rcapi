@@ -85,9 +85,10 @@ def authenticate(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Unauthorised")
 
 
-def send_commands(commands: list[str]) -> dict:
+def send_commands(commands: list[str], port: int | None = None) -> dict:
+    rcon_port = RCON_PORT if port is None else port
     try:
-        with Client(RCON_ADDRESS, RCON_PORT, passwd=RCON_PASSWORD) as rcon:
+        with Client(RCON_ADDRESS, rcon_port, passwd=RCON_PASSWORD) as rcon:
             results = [rcon.run(command) for command in commands]
     except Exception as exc:
         logger.exception("RCON command failed")
@@ -99,24 +100,30 @@ def send_commands(commands: list[str]) -> dict:
     return {
         "command_sent": True,
         "commands_sent": len(commands),
+        "rcon_port": rcon_port,
         "rcon_response": results[0] if len(results) == 1 else results,
     }
 
 
-class DropRequest(BaseModel):
+class RCONRequest(BaseModel):
+    # Override the Minecraft RCON port for this HTTP request only.
+    port: int | None = Field(default=None, ge=1, le=65535)
+
+
+class DropRequest(RCONRequest):
     item: ResourceID = "minecraft:diamond"
     count: int = Field(default=1, ge=1, le=64)
     player: PlayerName | None = None
 
 
-class GiveRequest(BaseModel):
+class GiveRequest(RCONRequest):
     item: ResourceID = "minecraft:diamond"
     count: int = Field(default=1, ge=1, le=2304)
     player: PlayerName | None = None
     custom_name: str | None = Field(default=None, max_length=256)
     nbt_data: dict | None = None
 
-class SummonRequest(BaseModel):
+class SummonRequest(RCONRequest):
     entity: ResourceID = "minecraft:zombie"
     count: int = Field(default=1, ge=1, le=10)
     player: PlayerName | None = None
@@ -126,7 +133,7 @@ class SummonRequest(BaseModel):
     name_visible: bool = True
 
 
-class EffectRequest(BaseModel):
+class EffectRequest(RCONRequest):
     effect: ResourceID = "minecraft:speed"
     duration: Annotated[int, Field(ge=1, le=1_000_000)] | Literal["infinite"] = 30
     amplifier: int = Field(default=0, ge=0, le=255)
@@ -134,23 +141,23 @@ class EffectRequest(BaseModel):
     player: PlayerName | None = None
 
 
-class WeatherRequest(BaseModel):
+class WeatherRequest(RCONRequest):
     weather: Literal["clear", "rain", "thunder"]
     duration: int | None = Field(default=None, ge=1, le=86400)
 
 
-class TimeRequest(BaseModel):
+class TimeRequest(RCONRequest):
     time: Literal["day", "noon", "night", "midnight"] | Annotated[
         int, Field(ge=0, le=2_147_483_647)
     ] = "day"
 
 
-class XPRequest(BaseModel):
+class XPRequest(RCONRequest):
     amount: int = Field(default=10, ge=-1_000_000, le=1_000_000)
     unit: Literal["points", "levels"] = "points"
     player: PlayerName | None = None
 
-class DamageRequest(BaseModel):
+class DamageRequest(RCONRequest):
     amount: float = Field(default=1, ge=0)
     type: Literal["generic", "fire", "fall", "explosion"] = "generic"
     player: PlayerName | None = None
@@ -165,7 +172,7 @@ def apply_damage(data: DamageRequest):
         "amount": data.amount,
         "type": damage_type,
         "target": target,
-        **send_commands([command]),
+        **send_commands([command], port=data.port),
     }
 
 @app.get("/health")
@@ -186,7 +193,7 @@ def drop_item(data: DropRequest):
         "item": data.item,
         "count": data.count,
         "target": target,
-        **send_commands([command]),
+        **send_commands([command], port=data.port),
     }
 
 
@@ -237,7 +244,7 @@ def give_item(data: GiveRequest):
         "target": target,
         "custom_name": data.custom_name,
         "nbt_data": data.nbt_data,
-        **send_commands([command]),
+        **send_commands([command], port=data.port),
     }
 
 
@@ -289,7 +296,7 @@ def summon_entity(data: SummonRequest):
         "custom_name": data.custom_name,
         "name_visible": data.name_visible,
         "nbt_data": nbt_data,
-        **send_commands([command] * data.count),
+        **send_commands([command] * data.count, port=data.port),
     }
 
 
@@ -307,7 +314,7 @@ def apply_effect(data: EffectRequest):
         "duration": data.duration,
         "amplifier": data.amplifier,
         "target": target,
-        **send_commands([command]),
+        **send_commands([command], port=data.port),
     }
 
 
@@ -318,19 +325,19 @@ def change_weather(data: WeatherRequest):
     if data.duration is not None:
         command += f" {data.duration}s"
     logger.info("Changing weather to %s", data.weather)
-    return {"weather": data.weather, **send_commands([command])}
+    return {"weather": data.weather, **send_commands([command], port=data.port)}
 
 
 @app.post("/time", dependencies=[Depends(authenticate)])
 def change_time(data: TimeRequest):
     command = f"time set {data.time}"
     logger.info("Setting time to %s", data.time)
-    return {"time": data.time, **send_commands([command])}
+    return {"time": data.time, **send_commands([command], port=data.port)}
 
 
 @app.post("/xp", dependencies=[Depends(authenticate)])
 def change_xp(data: XPRequest):
-    # Default to one random online player, never all players.
+    # Default to every online player.
     target = data.player or "@a"
     command = f"experience add {target} {data.amount} {data.unit}"
     logger.info("Changing XP by %d %s for %s", data.amount, data.unit, target)
@@ -338,7 +345,7 @@ def change_xp(data: XPRequest):
         "amount": data.amount,
         "unit": data.unit,
         "target": target,
-        **send_commands([command]),
+        **send_commands([command], port=data.port),
     }
 
 
